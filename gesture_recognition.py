@@ -122,13 +122,16 @@ class GestureDetector:
             gesture = "PEACE"
         elif self._is_pinch(lm):
             gesture = "PINCH"
-        elif len(self.prev_positions) >= self.smooth_window:
-            dy = self.prev_positions[-1][1] - self.prev_positions[0][1]
-            if dy < -0.06:
-                gesture = "SWIPE_UP"
-            elif dy > 0.06:
-                gesture = "SWIPE_DOWN"
+        elif len(pos_list) >= self.smooth_window:
+            if num_up >= 4:
+                dy = pos_list[-1][1] - pos_list[0][1]
+                dx = pos_list[-1][0] - pos_list[0][0]
+                if abs(dx) < 0.08:
+                    if dy < -0.15:
+                        gesture = "SWIPE_UP"
 
+                    elif dy > 0.15:
+                        gesture = "SWIPE_DOWN"
         if gesture:
             now  = time.time()
             last = self.last_time.get(gesture, 0)
@@ -150,7 +153,7 @@ class GestureDetector:
     def _is_pinch(self, lm):
         tx, ty = lm[4]
         ix, iy = lm[8]
-        return np.hypot(tx - ix, ty - iy) < 0.06
+        return np.hypot(tx - ix, ty - iy) < 0.04
 
 
 # ──────────────────────────────────────────────

@@ -275,7 +275,7 @@ class GestureEngine(QThread):
     def _is_pinch(self, lm):
         tx, ty = lm[4]
         ix, iy = lm[8]
-        return np.hypot(tx - ix, ty - iy) < 0.06
+        return np.hypot(tx - ix, ty - iy) < 0.04
 
     @staticmethod
     def _get_model():

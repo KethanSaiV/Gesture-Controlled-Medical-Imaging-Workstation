@@ -156,13 +156,16 @@ _NAME_TO_ID = {
 GESTURE_COOLDOWN = 1.5
 
 GESTURE_ACTIONS = {
-    "SWIPE_UP"   : "Previous Slice",
-    "SWIPE_DOWN" : "Next Slice",
-    "PINCH"      : "Zoom In",
-    "OPEN_PALM"  : "Reset Viewer",
-    "FIST"       : "Zoom Out",
-    "POINT_UP"   : "Scroll Up",
-    "PEACE"      : "Scroll Down",
+    "SWIPE_UP"        : "Previous Slice",
+    "SWIPE_DOWN"      : "Next Slice",
+    "PINCH"           : "Zoom In",
+    "FIST"            : "Zoom Out",
+    "POINT_UP"        : "Pan Mode",
+    # Two-hand gestures
+    "BOTH_PEACE"      : "Lock View",
+    "BOTH_L"          : "Unlock View",
+    "BOTH_FIST"       : "Reset View",
+    "BOTH_PALM"       : "Toggle Overlay",
 }
 
 COL_GREEN  = (0, 255, 120)
@@ -358,16 +361,30 @@ class TwoHandGestureEngine(QThread):
     gesture_detected = pyqtSignal(str, str)
     frame_ready      = pyqtSignal(np.ndarray)
     ai_mode_changed  = pyqtSignal(bool)
+    two_hand_gesture = pyqtSignal(str)    # "BOTH_PEACE", "BOTH_L", "BOTH_FIST", "BOTH_PALM"
+    pan_moved        = pyqtSignal(float, float)  # dx, dy normalised
+
+    TWO_HAND_HOLD     = 0.6  # seconds both hands must hold gesture to fire
+    PAN_SMOOTH        = 6    # frames of position history for pan smoothing
 
     def __init__(self):
         super().__init__()
-        self.running           = True
-        self.prev_pos_right    = []
-        self.prev_pos_left     = []
-        self.smooth_window     = 5
-        self.last_time         = {}
-        self._left_fist_held   = False
-        self._left_fist_start  = 0
+        self.running              = True
+        self.prev_pos_right       = []
+        self.prev_pos_left        = []
+        self.smooth_window        = 5
+        self.last_time            = {}
+        self._left_fist_held      = False
+        self._left_fist_start     = 0
+        # Two-hand gesture state
+        self._two_hand_gesture    = None   # current matching two-hand gesture
+        self._two_hand_start      = 0.0
+        self._two_hand_fired      = False
+        self._last_two_hand       = {}     # cooldown per two-hand gesture
+        # Pan
+        self._pan_history         = []
+        self._pan_active          = False
+        self._pan_prev_pos        = None
 
     def run(self):
         model_path = self._get_model()
@@ -375,9 +392,9 @@ class TwoHandGestureEngine(QThread):
         options    = vision.HandLandmarkerOptions(
             base_options=base_opts,
             num_hands=2,
-            min_hand_detection_confidence=0.5,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_hand_detection_confidence=0.2,
+            min_hand_presence_confidence=0.2,
+            min_tracking_confidence=0.2,
         )
         detector = vision.HandLandmarker.create_from_options(options)
 
@@ -407,13 +424,13 @@ class TwoHandGestureEngine(QThread):
                 for i, hand_lms in enumerate(result.hand_landmarks):
                     lm_list    = [(lm.x, lm.y) for lm in hand_lms]
                     handedness = result.handedness[i][0].category_name
-                    # FIX: swap because cv2.flip mirrors display
+                    # After cv2.flip: Left=Left, Right=Right (confirmed by debug)
                     if handedness == "Left":
-                        right_landmarks = lm_list
-                        self._draw_landmarks(frame, hand_lms, w, h, (0, 200, 100))
-                    else:
                         left_landmarks = lm_list
                         self._draw_landmarks(frame, hand_lms, w, h, (200, 100, 0))
+                    else:
+                        right_landmarks = lm_list
+                        self._draw_landmarks(frame, hand_lms, w, h, (0, 200, 100))
 
             left_gesture = None
             if left_landmarks:
@@ -431,8 +448,53 @@ class TwoHandGestureEngine(QThread):
 
             if right_landmarks:
                 gesture = self._classify_full(right_landmarks, "right")
+
+                # ── POINT_UP + movement → pan ─────────
+                fingers_up = self._fingers_up(right_landmarks)
+                is_point   = (fingers_up == [0, 1, 0, 0, 0])
+                if is_point:
+                    wrist_pos = right_landmarks[0]
+                    if self._pan_prev_pos is not None:
+                        dx = wrist_pos[0] - self._pan_prev_pos[0]
+                        dy = wrist_pos[1] - self._pan_prev_pos[1]
+                        if abs(dx) > 0.008 or abs(dy) > 0.008:
+                            self.pan_moved.emit(dx, dy)
+                    self._pan_prev_pos = wrist_pos
+                    self._pan_active   = True
+                    gesture = None
+                else:
+                    self._pan_prev_pos = None
+                    self._pan_active   = False
+
                 if gesture:
                     self.gesture_detected.emit(gesture, "right")
+
+            # ── Two-hand gesture detection ─────────────
+            # Runs whenever BOTH hands are visible
+            if left_landmarks and right_landmarks:
+                left_g  = self._classify_static(left_landmarks)
+                right_g = self._classify_static(right_landmarks)
+                two     = self._match_two_hand(left_g, right_g)
+
+                if two:
+                    now = time.time()
+                    if self._two_hand_gesture != two:
+                        # New gesture started
+                        self._two_hand_gesture = two
+                        self._two_hand_start   = now
+                        self._two_hand_fired   = False
+                    else:
+                        # Same gesture held — check hold duration
+                        held = now - self._two_hand_start
+                        if held >= self.TWO_HAND_HOLD and not self._two_hand_fired:
+                            cooldown = self._last_two_hand.get(two, 0)
+                            if now - cooldown >= 2.0:
+                                self._two_hand_fired        = True
+                                self._last_two_hand[two]    = now
+                                self.two_hand_gesture.emit(two)
+                else:
+                    self._two_hand_gesture = None
+                    self._two_hand_fired   = False
 
             now       = time.time()
             fps       = 1.0 / (now - prev_time + 1e-9)
@@ -478,17 +540,85 @@ class TwoHandGestureEngine(QThread):
             rx, ry = int(right_lm[0][0]*w), int(right_lm[0][1]*h)
             cv2.putText(frame, "RIGHT (Control)", (rx, ry-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_GREEN, 1)
+        # Two-hand gesture charge bar
+        if self._two_hand_gesture and not self._two_hand_fired:
+            held   = min(time.time() - self._two_hand_start, self.TWO_HAND_HOLD)
+            charge = held / self.TWO_HAND_HOLD
+            bar_w  = int(charge * 160)
+            bx, by = w//2 - 80, h - 55
+            colours = {
+                "BOTH_PEACE": (0,   80, 255),
+                "BOTH_L"    : (0,  200,  80),
+                "BOTH_FIST" : (0,   60, 220),
+                "BOTH_PALM" : (200, 160,  0),
+            }
+            bar_col = colours.get(self._two_hand_gesture, (200,200,200))
+            labels  = {
+                "BOTH_PEACE": "✌✌ LOCK",
+                "BOTH_L"    : "L+L UNLOCK",
+                "BOTH_FIST" : "✊✊ RESET",
+                "BOTH_PALM" : "🖐🖐 OVERLAY",
+            }
+            bar_lbl = labels.get(self._two_hand_gesture, self._two_hand_gesture)
+            cv2.rectangle(frame, (bx, by), (bx+160, by+10), (40,40,40), -1)
+            cv2.rectangle(frame, (bx, by), (bx+bar_w, by+10), bar_col, -1)
+            cv2.putText(frame, bar_lbl, (bx, by-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (220,220,220), 1)
+
+        # Pan active indicator
+        if self._pan_active:
+            cv2.putText(frame, "PAN MODE", (w-90, 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_YELLOW, 2)
+
         cv2.rectangle(frame, (0, h-35), (w, h), (10,10,10), -1)
         if not left_lm and not right_lm:
             cv2.putText(frame, "Show hands to camera",
                         (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80,80,80), 1)
         elif not ai_mode:
-            cv2.putText(frame, "Hold LEFT FIST 1 sec to activate AI",
-                        (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COL_ORANGE, 1)
+            cv2.putText(frame, "L.FIST=AI | ✌✌=Lock | LL=Unlock | ✊✊=Reset",
+                        (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, COL_ORANGE, 1)
         else:
-            cv2.putText(frame, "AI active | Use RIGHT hand to navigate",
-                        (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COL_GREEN, 1)
+            cv2.putText(frame, "AI ON | ✌✌=Lock | LL=Unlock | POINT+move=Pan",
+                        (10, h-12), cv2.FONT_HERSHEY_SIMPLEX, 0.38, COL_GREEN, 1)
         return frame
+
+    def _match_two_hand(self, left_g, right_g) -> str | None:
+        """
+        Match both-hand gesture combinations.
+        Returns gesture key or None.
+
+        BOTH_PEACE : both hands PEACE ✌️✌️
+        BOTH_L     : both hands L-shape (thumb+index up, others down) 👍☝️
+        BOTH_FIST  : both hands FIST 👊👊
+        BOTH_PALM  : both hands OPEN_PALM 🖐🖐
+        """
+        if left_g is None or right_g is None:
+            return None
+        combo = {left_g, right_g}
+        if left_g == "PEACE"     and right_g == "PEACE"     : return "BOTH_PEACE"
+        if left_g == "FIST"      and right_g == "FIST"      : return "BOTH_FIST"
+        if left_g == "OPEN_PALM" and right_g == "OPEN_PALM" : return "BOTH_PALM"
+        # L-shape: thumb + index extended, middle/ring/pinky down
+        if left_g == "L_SHAPE"   and right_g == "L_SHAPE"   : return "BOTH_L"
+        return None
+
+    def _is_L_shape(self, lm) -> bool:
+        """
+        L-shape: thumb extended sideways + index pointing up,
+        middle/ring/pinky all down.
+        Orientation-independent using wrist-distance method.
+        """
+        tips = [4, 8, 12, 16, 20]
+        pip  = [3, 6, 10, 14, 18]
+        # Index must be extended
+        idx_ext  = lm[tips[1]][1] < lm[pip[1]][1]
+        # Middle, ring, pinky must be DOWN
+        mid_down  = lm[tips[2]][1] > lm[pip[2]][1]
+        ring_down = lm[tips[3]][1] > lm[pip[3]][1]
+        pink_down = lm[tips[4]][1] > lm[pip[4]][1]
+        # Thumb extended (use x-axis distance from palm)
+        thu_ext  = abs(lm[tips[0]][0] - lm[0][0]) > 0.08
+        return idx_ext and mid_down and ring_down and pink_down and thu_ext
 
     def _classify_static(self, lm):
         fingers_up = self._fingers_up(lm)
@@ -497,7 +627,8 @@ class TwoHandGestureEngine(QThread):
         if num_up == 5: return "OPEN_PALM"
         if fingers_up == [0,1,0,0,0]: return "POINT_UP"
         if fingers_up == [0,1,1,0,0]: return "PEACE"
-        if self._is_pinch(lm): return "PINCH"
+        if self._is_pinch(lm):        return "PINCH"
+        if self._is_L_shape(lm):      return "L_SHAPE"
         return None
 
     def _classify_full(self, lm, hand_key):
@@ -619,6 +750,9 @@ class MainWindow(QMainWindow):
         self.seg_mask     = None
         self.show_overlay = False
         self.opacity      = 0.45
+        self.pan_x        = 0      # pan offset in pixels (image coords)
+        self.pan_y        = 0
+        self.view_locked  = False  # True = zoom/pan/slice locked
         self._setup_ui()
         self._start_gesture_engine()
 
@@ -706,7 +840,24 @@ class MainWindow(QMainWindow):
         gg = QVBoxLayout(gest_group)
         self.lbl_gesture = QLabel("Waiting..."); self.lbl_gesture.setStyleSheet("color:#3af; font-size:12px; font-weight:bold; qproperty-alignment:AlignCenter;"); gg.addWidget(self.lbl_gesture)
         self.lbl_ai_indicator = QLabel("AI Mode: OFF"); self.lbl_ai_indicator.setStyleSheet("color:#666; font-size:11px; qproperty-alignment:AlignCenter;"); gg.addWidget(self.lbl_ai_indicator)
-        for line in ["LEFT FIST (hold 1s) → AI Mode","RIGHT Swipe Up → Prev Slice","RIGHT Swipe Down → Next Slice","RIGHT Pinch → Zoom In","RIGHT Fist → Zoom Out","RIGHT Open Palm → Reset","RIGHT Point Up → Scroll Up","RIGHT Peace → Scroll Down"]:
+
+        self.lbl_lock_indicator = QLabel("🔓 View: UNLOCKED")
+        self.lbl_lock_indicator.setStyleSheet("color:#666; font-size:11px; qproperty-alignment:AlignCenter;")
+        gg.addWidget(self.lbl_lock_indicator)
+
+        for line in [
+            "LEFT  FIST hold 1s  → AI Mode",
+            "RIGHT Swipe Up/Down → Prev/Next Slice",
+            "RIGHT Pinch         → Zoom In",
+            "RIGHT Fist          → Zoom Out",
+            "RIGHT POINT_UP+move → Pan",
+            "── Two-Hand Gestures ─────────────",
+            "✌️✌️  Both PEACE     → Lock View",
+            "👍☝️  Both L-shape   → Unlock View",
+            "👊👊  Both FIST     → Reset View",
+            "🖐🖐  Both PALM     → Toggle Overlay",
+            "── Hold 0.6s to trigger ──────────",
+        ]:
             l = QLabel(line); l.setStyleSheet("color:#444; font-size:9px;"); gg.addWidget(l)
         left.addWidget(gest_group)
 
@@ -747,6 +898,8 @@ class MainWindow(QMainWindow):
         self.gesture_engine.gesture_detected.connect(self._on_gesture)
         self.gesture_engine.frame_ready.connect(self._on_cam_frame)
         self.gesture_engine.ai_mode_changed.connect(self._on_ai_mode_changed)
+        self.gesture_engine.two_hand_gesture.connect(self._on_two_hand_gesture)
+        self.gesture_engine.pan_moved.connect(self._on_pan_gesture)
         self.gesture_engine.start()
         self.lbl_cam_status.setText("● Camera: active")
         self.lbl_cam_status.setStyleSheet("color:#3f3; font-size:10px;")
@@ -755,13 +908,83 @@ class MainWindow(QMainWindow):
         action = GESTURE_ACTIONS.get(gesture, gesture)
         self.lbl_gesture.setText(f"{gesture}\n{action}")
         self.status.showMessage(f"{hand.upper()} hand: {gesture}  →  {action}")
+
+        # When view is locked, block all navigation except unlock
+        if self.view_locked:
+            self.status.showMessage("🔒 View LOCKED — hold PEACE 1.5s to unlock")
+            return
+
         if   gesture == "SWIPE_UP"  : self._prev_slice()
         elif gesture == "SWIPE_DOWN": self._next_slice()
         elif gesture == "OPEN_PALM" : self._reset_view()
-        elif gesture == "POINT_UP"  : self._prev_slice()
-        elif gesture == "PEACE"     : self._next_slice()
         elif gesture == "PINCH"     : self._zoom_in()
         elif gesture == "FIST"      : self._zoom_out()
+        # POINT_UP and PEACE are now handled by hold-timer in gesture engine
+        # (pan and lock respectively) — single-tap still scrolls as fallback
+        elif gesture == "POINT_UP"  : self._prev_slice()
+        elif gesture == "PEACE"     : self._next_slice()
+
+    # ── Two-Hand Gesture Handler ───────────────────────────────
+    def _on_two_hand_gesture(self, gesture):
+        """Handle two-hand gestures fired from gesture engine."""
+        if gesture == "BOTH_PEACE":
+            # Lock view (only if not already locked)
+            if not self.view_locked:
+                self._toggle_lock()
+                self.lbl_gesture.setText("BOTH PEACE\n🔒 View Locked")
+        elif gesture == "BOTH_L":
+            # Unlock view (only if locked)
+            if self.view_locked:
+                self._toggle_lock()
+                self.lbl_gesture.setText("BOTH L-SHAPE\n🔓 View Unlocked")
+        elif gesture == "BOTH_FIST":
+            self._reset_view()
+            self.lbl_gesture.setText("BOTH FIST\n↺ View Reset")
+        elif gesture == "BOTH_PALM":
+            self._toggle_overlay()
+            self.lbl_gesture.setText("BOTH PALM\n👁 Overlay Toggled")
+
+    # ── View Lock ──────────────────────────────────────────────
+    def _toggle_lock(self):
+        self.view_locked = not self.view_locked
+        if self.view_locked:
+            self.lbl_lock_indicator.setText("🔒 View: LOCKED")
+            self.lbl_lock_indicator.setStyleSheet(
+                "color:#f33; font-size:11px; font-weight:bold; qproperty-alignment:AlignCenter;")
+            self.dicom_label.setStyleSheet(
+                "background:#0d0d0d; color:#333; border:3px solid #f33; border-radius:6px;")
+            self.status.showMessage("🔒 View LOCKED — zoom, pan and slice frozen")
+        else:
+            self.lbl_lock_indicator.setText("🔓 View: UNLOCKED")
+            self.lbl_lock_indicator.setStyleSheet(
+                "color:#3f3; font-size:11px; qproperty-alignment:AlignCenter;")
+            # Restore border based on AI mode
+            if self.ai_mode:
+                self.dicom_label.setStyleSheet(
+                    "background:#0d0d0d; color:#333; border:2px solid #f90; border-radius:6px;")
+            else:
+                self.dicom_label.setStyleSheet(
+                    "background:#0d0d0d; color:#333; border:1px solid #222; border-radius:6px;")
+            self.status.showMessage("🔓 View UNLOCKED")
+
+    # ── Pan ────────────────────────────────────────────────────
+    def _pan(self, dx, dy):
+        """Move pan offset. dx/dy in image pixels."""
+        if self.view_locked or self.volume is None:
+            return
+        h, w = self.volume[self.current].shape
+        max_pan_x = int(w * (1 - 1/max(self.zoom, 1.0)))
+        max_pan_y = int(h * (1 - 1/max(self.zoom, 1.0)))
+        self.pan_x = max(-max_pan_x, min(max_pan_x, self.pan_x + dx))
+        self.pan_y = max(-max_pan_y, min(max_pan_y, self.pan_y + dy))
+        self._show_slice()
+
+    def _on_pan_gesture(self, dx_norm, dy_norm):
+        """Called from gesture engine with normalised deltas (-1 to 1)."""
+        if self.volume is None or self.view_locked:
+            return
+        h, w = self.volume[self.current].shape
+        self._pan(int(dx_norm * w * 0.15), int(dy_norm * h * 0.15))
 
     def _on_ai_mode_changed(self, active):
         self.ai_mode = active
@@ -852,17 +1075,46 @@ class MainWindow(QMainWindow):
     def _show_slice(self):
         if self.volume is None: return
         raw = self.volume[self.current]; img = self._apply_window(raw)
-        if self.zoom != 1.0:
-            h,w=img.shape; new_h=int(h/self.zoom); new_w=int(w/self.zoom)
-            cy,cx=h//2,w//2
-            y1=max(0,cy-new_h//2); y2=min(h,cy+new_h//2); x1=max(0,cx-new_w//2); x2=min(w,cx+new_w//2)
-            img=img[y1:y2,x1:x2]; img=cv2.resize(img,(w,h),interpolation=cv2.INTER_LINEAR)
+        if self.zoom != 1.0 or (self.pan_x != 0 or self.pan_y != 0):
+            h, w   = img.shape
+            new_h  = int(h / self.zoom)
+            new_w  = int(w / self.zoom)
+            # Pan offsets shift the crop centre
+            cy = h//2 + self.pan_y
+            cx = w//2 + self.pan_x
+            y1 = max(0, cy - new_h//2); y2 = min(h, y1 + new_h)
+            x1 = max(0, cx - new_w//2); x2 = min(w, x1 + new_w)
+            # Clamp so we never crop outside image
+            if y2 > h: y1 = max(0, h - new_h); y2 = h
+            if x2 > w: x1 = max(0, w - new_w); x2 = w
+            img = cv2.resize(img[y1:y2, x1:x2], (w, h), interpolation=cv2.INTER_LINEAR)
         if self.show_overlay and self.seg_mask is not None:
             mz=self.seg_mask.shape[0]; vz=self.volume.shape[0]
             mask_idx=min(int(self.current*mz/vz), mz-1)
             mask_slice=self.seg_mask[mask_idx]
+            # Resize mask to match original volume slice dimensions first
+            raw_h, raw_w = self.volume[self.current].shape
+            if mask_slice.shape != (raw_h, raw_w):
+                mask_slice=cv2.resize(mask_slice.astype(np.float32),
+                                      (raw_w, raw_h),
+                                      interpolation=cv2.INTER_NEAREST).astype(np.int32)
+            # Apply SAME zoom + pan to mask as to the image
+            if self.zoom != 1.0 or (self.pan_x != 0 or self.pan_y != 0):
+                h0, w0 = mask_slice.shape
+                new_h  = int(h0 / self.zoom); new_w = int(w0 / self.zoom)
+                cy = h0//2 + self.pan_y; cx = w0//2 + self.pan_x
+                y1 = max(0, cy - new_h//2); y2 = min(h0, y1 + new_h)
+                x1 = max(0, cx - new_w//2); x2 = min(w0, x1 + new_w)
+                if y2 > h0: y1 = max(0, h0 - new_h); y2 = h0
+                if x2 > w0: x1 = max(0, w0 - new_w); x2 = w0
+                mask_slice = cv2.resize(mask_slice[y1:y2, x1:x2].astype(np.float32),
+                                        (w0, h0),
+                                        interpolation=cv2.INTER_NEAREST).astype(np.int32)
+            # Now img and mask_slice are both at display resolution — overlay them
             if mask_slice.shape != img.shape:
-                mask_slice=cv2.resize(mask_slice.astype(np.float32),(img.shape[1],img.shape[0]),interpolation=cv2.INTER_NEAREST).astype(np.int32)
+                mask_slice=cv2.resize(mask_slice.astype(np.float32),
+                                      (img.shape[1],img.shape[0]),
+                                      interpolation=cv2.INTER_NEAREST).astype(np.int32)
             display=apply_segmentation_overlay(img,mask_slice,self.opacity)
             h,w=display.shape[:2]; qimg=QImage(display.tobytes(),w,h,w*3,QImage.Format_BGR888)
         else:
@@ -894,8 +1146,15 @@ class MainWindow(QMainWindow):
             self.slider_wl.setValue(int(self.wl)); self.slider_ww.setValue(int(self.ww))
     def _reset_view(self):
         if self.volume is not None:
-            self.current=self.volume.shape[0]//2; self.zoom=1.0
-            self.slice_slider.setValue(self.current); self._reset_windowing()
+            self.current  = self.volume.shape[0]//2
+            self.zoom     = 1.0
+            self.pan_x    = 0
+            self.pan_y    = 0
+            self.view_locked = False
+            self.lbl_lock_indicator.setText("🔓 View: UNLOCKED")
+            self.lbl_lock_indicator.setStyleSheet("color:#666; font-size:11px; qproperty-alignment:AlignCenter;")
+            self.slice_slider.setValue(self.current)
+            self._reset_windowing()
     def _update_meta(self, meta):
         for k,v in meta.items():
             if k in self.meta_labels: self.meta_labels[k].setText(v)

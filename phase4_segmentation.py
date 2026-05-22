@@ -20,6 +20,8 @@ import tempfile
 import shutil
 import subprocess
 
+from scipy.ndimage import gaussian_filter, median_filter
+
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
@@ -28,7 +30,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QPushButton, QLabel, QSlider, QFileDialog,
     QStatusBar, QGroupBox, QGridLayout, QProgressBar,
-    QScrollArea
+    QScrollArea, QComboBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QFont
@@ -153,13 +155,23 @@ _NAME_TO_ID = {
     "brain"                       : 50,
 }
 
-GESTURE_COOLDOWN = 1.5
+# Per-gesture cooldowns (seconds)
+GESTURE_COOLDOWN = {
+    "SWIPE_UP"   : 0.5,   # fast slice nav
+    "SWIPE_DOWN" : 0.5,
+    "PINCH"      : 0.8,
+    "FIST"       : 0.8,
+    "OPEN_PALM"  : 1.2,
+    "POINT_UP"   : 0.1,   # pan needs fast updates
+    "PEACE"      : 0.8,
+}
 
 GESTURE_ACTIONS = {
     "SWIPE_UP"        : "Previous Slice",
     "SWIPE_DOWN"      : "Next Slice",
     "PINCH"           : "Zoom In",
     "FIST"            : "Zoom Out",
+    "OPEN_PALM"       : "Reset View",
     "POINT_UP"        : "Pan Mode",
     # Two-hand gestures
     "BOTH_PEACE"      : "Lock View",
@@ -175,6 +187,664 @@ COL_ORANGE = (0, 165, 255)
 
 def _pick_task(modality: str) -> str:
     return "total_mr" if modality.upper() in ("MR", "MRI") else "total"
+
+
+import cv2
+import numpy as np
+import time
+import math
+from collections import deque
+
+from scipy.ndimage import gaussian_filter, median_filter
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
+from PyQt5.QtCore import QThread, pyqtSignal
+
+
+COL_GREEN  = (0, 255, 120)
+COL_YELLOW = (0, 220, 255)
+COL_ORANGE = (0, 165, 255)
+COL_RED    = (0,  60, 220)
+COL_CYAN   = (255, 220, 0)
+COL_WHITE  = (255, 255, 255)
+
+
+class GestureEngine(QThread):
+    """
+    Medical-grade gesture engine implementing the 12-gesture chart.
+
+    Signals:
+        slice_navigate(int)    : +1 next, -1 prev
+        zoom_changed(float)    : zoom delta (+0.05 or -0.05)
+        pan_moved(float,float) : dx, dy normalised
+        window_changed(float,float): dwl, dww
+        lock_toggled()         : lock/unlock view
+        reset_triggered()      : reset view
+        segmentation_triggered(): run segmentation
+        overlay_intensity(int) : +1 or -1
+        recalibrate()          : recalibrate
+        frame_ready(ndarray)   : camera frame
+    """
+
+    slice_navigate          = pyqtSignal(int)
+    zoom_changed            = pyqtSignal(float)
+    pan_moved               = pyqtSignal(float, float)
+    window_changed          = pyqtSignal(float, float)
+    lock_toggled            = pyqtSignal()
+    reset_triggered         = pyqtSignal()
+    segmentation_triggered  = pyqtSignal()
+    overlay_intensity       = pyqtSignal(int)
+    recalibrate             = pyqtSignal()
+    frame_ready             = pyqtSignal(np.ndarray)
+
+    # ── Tuning ─────────────────────────────────────────────────
+    SWIPE_THRESHOLD     = 0.04   # normalised y movement to fire swipe
+    SWIPE_COOLDOWN      = 0.35   # seconds between slice steps
+    ZOOM_SENSITIVITY    = 2.5    # rotation degrees per zoom step
+    PAN_DEADZONE        = 0.004  # min movement to pan (lowered)
+    PAN_SCALE           = 1.5    # pan speed (increased — normalised coords are tiny)
+    WINDOW_SCALE        = 0.015  # windowing sensitivity (unused — see _detect_windowing)
+    LOCK_HOLD           = 2.0    # seconds to hold L-shape
+    SEG_HOLD            = 3.0    # seconds to hold both thumbs up
+    OVERLAY_COOLDOWN    = 0.3    # seconds between overlay steps
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+
+        # State
+        self._last_swipe        = 0.0
+        self._last_overlay      = 0.0
+
+        # Rotation (zoom)
+        self._prev_wrist_angle  = None
+        self._rotation_accum    = 0.0
+
+        # Pan
+        self._pan_locked        = False   # True = index held 2s, panning active
+        self._pan_point_start   = 0.0
+        self._pan_prev_pos      = None
+        self._pan_hold_done     = False
+
+        # Lock
+        self._lock_start        = 0.0
+        self._lock_held         = False
+        self._lock_fired        = False
+
+        # Segmentation (both thumbs up 3s)
+        self._seg_start         = 0.0
+        self._seg_held          = False
+        self._seg_fired         = False
+
+        # Windowing (two index fingers)
+        self._win_prev_dist     = None
+
+        # Overlay (thumb + two fingers)
+        self._overlay_prev_x    = None
+
+        # Recalibrate (A-shape / two index tips meeting)
+        self._recal_fired       = False
+        self._recal_cooldown    = 0.0
+
+        # Status display
+        self._status_msg        = ""
+        self._status_time       = 0.0
+
+    def run(self):
+        import os, urllib.request
+        model_path = "hand_landmarker.task"
+        if not os.path.exists(model_path):
+            print("Downloading hand landmark model...")
+            urllib.request.urlretrieve(
+                "https://storage.googleapis.com/mediapipe-models/"
+                "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                model_path
+            )
+
+        base_opts = mp_python.BaseOptions(model_asset_path=model_path)
+        options   = vision.HandLandmarkerOptions(
+            base_options=base_opts,
+            num_hands=2,
+            min_hand_detection_confidence=0.2,
+            min_hand_presence_confidence=0.2,
+            min_tracking_confidence=0.2,
+        )
+        detector = vision.HandLandmarker.create_from_options(options)
+
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
+        prev_time = time.time()
+
+        while self.running:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+
+            frame = cv2.flip(frame, 1)
+            h, w  = frame.shape[:2]
+            now   = time.time()
+
+            rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = detector.detect(mp_img)
+
+            # ── Parse hands ────────────────────────────────────
+            left_lm  = None
+            right_lm = None
+
+            if result.hand_landmarks and result.handedness:
+                for i, hand_lms in enumerate(result.hand_landmarks):
+                    lm       = [(lm.x, lm.y) for lm in hand_lms]
+                    side     = result.handedness[i][0].category_name
+                    color    = (0, 200, 100) if side == "Right" else (200, 100, 0)
+                    self._draw_hand(frame, hand_lms, w, h, color)
+                    if side == "Left":
+                        left_lm = lm
+                    else:
+                        right_lm = lm
+
+            # Use dominant hand for single-hand gestures
+            # Priority: whichever is detected; if both, right = control
+            ctrl_lm  = right_lm or left_lm
+            other_lm = left_lm if right_lm else None
+
+            # ── GESTURE 11: Swipe up/down → navigate slices ────
+            if ctrl_lm:
+                self._detect_swipe(ctrl_lm, now)
+
+            # ── GESTURE 01: Pinch/spread → zoom ────────────────
+            if ctrl_lm and not self._pan_locked:
+                self._detect_rotation_zoom(ctrl_lm, now)
+            else:
+                self._pinch_prev_dist  = None
+                self._pinch_zoom_accum = 0.0
+
+            # ── GESTURE 02: Index point hold 2s → pan ──────────
+            if ctrl_lm:
+                self._detect_pan(ctrl_lm, now)
+
+            # ── GESTURE 03: Two index fingers → windowing ───────
+            if left_lm and right_lm:
+                self._detect_windowing(left_lm, right_lm, now)
+            else:
+                self._win_prev_dist = None
+
+            # ── GESTURE 04: L-shape hold 2s → lock/unlock ───────
+            if ctrl_lm:
+                self._detect_lock(ctrl_lm, now)
+
+            # ── GESTURE 05: Three fingers → reset ───────────────
+            if ctrl_lm:
+                self._detect_reset(ctrl_lm, now)
+
+            # ── GESTURE 06: Both thumbs up 3s → segmentation ────
+            if left_lm and right_lm:
+                self._detect_segmentation(left_lm, right_lm, now)
+            else:
+                self._seg_held  = False
+                self._seg_fired = False
+
+            # ── GESTURE 07: Thumb + two fingers → overlay ───────
+            if left_lm and right_lm:
+                self._detect_overlay_intensity(left_lm, right_lm, now)
+            else:
+                self._overlay_prev_x = None
+
+            # ── GESTURE 08: A-shape (two index tips) → recal ────
+            if left_lm and right_lm:
+                self._detect_recalibrate(left_lm, right_lm, now)
+
+            # ── Draw overlay ────────────────────────────────────
+            fps       = 1.0 / (now - prev_time + 1e-9)
+            prev_time = now
+            frame     = self._draw_ui(frame, ctrl_lm, left_lm, right_lm, fps, w, h, now)
+            self.frame_ready.emit(frame.copy())
+
+        cap.release()
+
+    def stop(self):
+        self.running = False
+
+    # ──────────────────────────────────────────────────────────
+    #  Gesture Detectors
+    # ──────────────────────────────────────────────────────────
+
+    def _detect_swipe(self, lm, now):
+        """Gesture 11: Swipe up/down with any hand posture."""
+        # Use wrist + middle finger base motion over 6 frame buffer
+        if not hasattr(self, '_swipe_buf'):
+            self._swipe_buf = deque(maxlen=6)
+        self._swipe_buf.append((lm[0][1], now))
+        if len(self._swipe_buf) < 4:
+            return
+        dy = self._swipe_buf[-1][0] - self._swipe_buf[0][0]
+        dt = self._swipe_buf[-1][1] - self._swipe_buf[0][1]
+        if dt < 0.001:
+            return
+        velocity = abs(dy) / dt
+        if velocity < 0.15:   # must be fast
+            return
+        if now - self._last_swipe < self.SWIPE_COOLDOWN:
+            return
+        if dy < -self.SWIPE_THRESHOLD:
+            self._last_swipe = now
+            self._swipe_buf.clear()
+            self.slice_navigate.emit(-1)
+            self._status("Swipe UP → Prev Slice")
+        elif dy > self.SWIPE_THRESHOLD:
+            self._last_swipe = now
+            self._swipe_buf.clear()
+            self.slice_navigate.emit(1)
+            self._status("Swipe DOWN → Next Slice")
+
+    def _detect_rotation_zoom(self, lm, now):
+        """
+        Gesture 01 (REVISED): Pinch = zoom in, Spread = zoom out.
+        Uses thumb-index distance normalised by palm size.
+        Much more intuitive and doesn't conflict with swipe.
+        """
+        if not hasattr(self, '_pinch_prev_dist'):
+            self._pinch_prev_dist = None
+            self._pinch_zoom_accum = 0.0
+
+        # Thumb tip to index tip distance
+        tx, ty = lm[4]
+        ix, iy = lm[8]
+        dist   = math.hypot(tx - ix, ty - iy)
+
+        # Normalise by palm size (wrist to middle MCP)
+        palm   = math.hypot(lm[9][0]-lm[0][0], lm[9][1]-lm[0][1])
+        if palm < 0.01:
+            return
+        dist_norm = dist / palm
+
+        if self._pinch_prev_dist is None:
+            self._pinch_prev_dist = dist_norm
+            return
+
+        delta = dist_norm - self._pinch_prev_dist
+        self._pinch_prev_dist = dist_norm
+
+        # Accumulate small deltas to avoid jitter
+        self._pinch_zoom_accum += delta
+
+        if abs(self._pinch_zoom_accum) > 0.08:
+            direction = 1 if self._pinch_zoom_accum > 0 else -1
+            self._pinch_zoom_accum = 0.0
+            self.zoom_changed.emit(direction * 0.12)
+            self._status(f"Pinch {'open' if direction > 0 else 'close'} → Zoom {'In' if direction > 0 else 'Out'}")
+
+    def _detect_pan(self, lm, now):
+        """Gesture 02: Index point → hold 2s → move = pan."""
+        fingers = self._fingers_up(lm)
+        is_pointing = (fingers[1] == 1 and fingers[2] == 0 and
+                       fingers[3] == 0 and fingers[4] == 0)
+
+        if is_pointing:
+            if not self._pan_hold_done:
+                if self._pan_point_start == 0.0:
+                    self._pan_point_start = now
+                held = now - self._pan_point_start
+                if held >= 2.0:
+                    self._pan_hold_done = True
+                    self._pan_prev_pos  = lm[8]  # index tip
+                    self._status("Pan ACTIVE — move hand")
+                else:
+                    # Show charging bar
+                    self._status(f"Hold to pan... {held:.1f}s / 2.0s")
+            else:
+                # Panning active
+                pos = lm[8]
+                if self._pan_prev_pos is not None:
+                    dx = pos[0] - self._pan_prev_pos[0]
+                    dy = pos[1] - self._pan_prev_pos[1]
+                    if abs(dx) > self.PAN_DEADZONE or abs(dy) > self.PAN_DEADZONE:
+                        self.pan_moved.emit(
+                            dx * self.PAN_SCALE,
+                            dy * self.PAN_SCALE
+                        )
+                self._pan_prev_pos = pos
+                self._pan_locked   = True
+        else:
+            # Reset pan state when not pointing
+            self._pan_point_start = 0.0
+            self._pan_hold_done   = False
+            self._pan_prev_pos    = None
+            self._pan_locked      = False
+
+    def _detect_windowing(self, left_lm, right_lm, now):
+        """
+        Gesture 03: Two index fingers apart/together → Window Level (WL).
+
+        Apart  (+distance) → WL increases (brighter)
+        Together (-distance) → WL decreases (darker)
+
+        WL controls brightness/contrast centre point.
+        High sensitivity: delta * 1500 gives ~30-150 HU per gesture unit.
+        """
+        l_fingers = self._fingers_up(left_lm)
+        r_fingers = self._fingers_up(right_lm)
+        l_point = (l_fingers[1] == 1 and l_fingers[2] == 0 and
+                   l_fingers[3] == 0 and l_fingers[4] == 0)
+        r_point = (r_fingers[1] == 1 and r_fingers[2] == 0 and
+                   r_fingers[3] == 0 and r_fingers[4] == 0)
+        if not (l_point and r_point):
+            self._win_prev_dist = None
+            return
+
+        lx, ly = left_lm[8]
+        rx, ry = right_lm[8]
+        dist   = math.hypot(rx - lx, ry - ly)
+
+        if self._win_prev_dist is None:
+            self._win_prev_dist = dist
+            return
+
+        delta = dist - self._win_prev_dist
+        self._win_prev_dist = dist
+
+        if abs(delta) > 0.003:   # lower threshold = more responsive
+            # Emit WL change (first param), WW unchanged (second param = 0)
+            dwl = delta * 1500   # high sensitivity: ~45-150 HU per cm of finger movement
+            self.window_changed.emit(dwl, 0)
+            self._status(f"WL {'up' if delta > 0 else 'down'} ({dwl:+.0f})")
+
+    def _detect_lock(self, lm, now):
+        """Gesture 04: L-shape single hand hold 2s → lock/unlock."""
+        if self._is_L_shape(lm):
+            if not self._lock_held:
+                self._lock_held  = True
+                self._lock_start = now
+                self._lock_fired = False
+            held = now - self._lock_start
+            if held >= self.LOCK_HOLD and not self._lock_fired:
+                self._lock_fired = True
+                self.lock_toggled.emit()
+                self._status("L-shape 2s → Lock/Unlock View")
+        else:
+            self._lock_held  = False
+            self._lock_fired = False
+
+    def _detect_reset(self, lm, now):
+        """Gesture 05: Three fingers (index+middle+ring) → reset."""
+        if not hasattr(self, '_reset_cooldown'):
+            self._reset_cooldown = 0.0
+        fingers = self._fingers_up(lm)
+        three = (fingers[0] == 0 and fingers[1] == 1 and
+                 fingers[2] == 1 and fingers[3] == 1 and fingers[4] == 0)
+        if three and now - self._reset_cooldown > 2.0:
+            self._reset_cooldown = now
+            self.reset_triggered.emit()
+            self._status("Three Fingers → Reset View")
+
+    def _detect_segmentation(self, left_lm, right_lm, now):
+        """Gesture 06: Both thumbs up hold 3s → run segmentation."""
+        l_thumb = self._is_thumb_up(left_lm)
+        r_thumb = self._is_thumb_up(right_lm)
+        if l_thumb and r_thumb:
+            if not self._seg_held:
+                self._seg_held  = True
+                self._seg_start = now
+                self._seg_fired = False
+            held = now - self._seg_start
+            if held >= self.SEG_HOLD and not self._seg_fired:
+                self._seg_fired = True
+                self.segmentation_triggered.emit()
+                self._status("Both Thumbs 3s → SEGMENTATION STARTED!")
+            else:
+                self._status(f"Hold both thumbs... {held:.1f}s / 3.0s")
+        else:
+            self._seg_held  = False
+            self._seg_fired = False
+
+    def _detect_overlay_intensity(self, left_lm, right_lm, now):
+        """Gesture 07: Thumb up one hand + two fingers other → overlay."""
+        l_thumb = self._is_thumb_up(left_lm)
+        r_thumb = self._is_thumb_up(right_lm)
+        l_two   = self._is_two_fingers(left_lm)
+        r_two   = self._is_two_fingers(right_lm)
+
+        if (l_thumb and r_two) or (r_thumb and l_two):
+            two_lm = right_lm if l_thumb else left_lm
+            # Track horizontal movement of the two-finger hand
+            mid_x = (two_lm[8][0] + two_lm[12][0]) / 2
+            if self._overlay_prev_x is not None:
+                dx = mid_x - self._overlay_prev_x
+                if abs(dx) > 0.02 and now - self._last_overlay > self.OVERLAY_COOLDOWN:
+                    self._last_overlay = now
+                    direction = 1 if dx > 0 else -1
+                    self.overlay_intensity.emit(direction)
+                    self._status(f"Overlay {'brighter' if direction > 0 else 'dimmer'}")
+            self._overlay_prev_x = mid_x
+        else:
+            self._overlay_prev_x = None
+
+    def _detect_recalibrate(self, left_lm, right_lm, now):
+        """Gesture 08: Two index fingertips touch (A-shape) → recalibrate."""
+        l_fingers = self._fingers_up(left_lm)
+        r_fingers = self._fingers_up(right_lm)
+        l_point = (l_fingers[1] == 1 and l_fingers[2] == 0)
+        r_point = (r_fingers[1] == 1 and r_fingers[2] == 0)
+        if not (l_point and r_point):
+            self._recal_fired = False
+            return
+        dist = math.hypot(
+            left_lm[8][0] - right_lm[8][0],
+            left_lm[8][1] - right_lm[8][1]
+        )
+        if dist < 0.05 and not self._recal_fired and now - self._recal_cooldown > 3.0:
+            self._recal_fired    = True
+            self._recal_cooldown = now
+            self.recalibrate.emit()
+            self._status("A-shape → Recalibrate!")
+        elif dist > 0.1:
+            self._recal_fired = False
+
+    # ──────────────────────────────────────────────────────────
+    #  Hand Classifiers
+    # ──────────────────────────────────────────────────────────
+
+    def _fingers_up(self, lm):
+        """Returns [thumb, index, middle, ring, pinky] 1=up 0=down."""
+        tips = [4, 8, 12, 16, 20]
+        pip  = [3, 6, 10, 14, 18]
+        thumb = 1 if lm[tips[0]][0] > lm[pip[0]][0] else 0
+        rest  = [1 if lm[tips[i]][1] < lm[pip[i]][1] else 0 for i in range(1, 5)]
+        return [thumb] + rest
+
+    def _is_thumb_up(self, lm) -> bool:
+        """
+        Thumb up: thumb tip clearly above wrist, all fingers curled.
+        Uses wrist-distance method — works palm-facing-camera.
+        """
+        # Thumb tip must be well above wrist
+        thumb_tip_y  = lm[4][1]
+        wrist_y      = lm[0][1]
+        thumb_above  = (wrist_y - thumb_tip_y) > 0.12   # at least 12% of frame height
+
+        # All 4 fingers must be DOWN (tips below their PIP joints)
+        tips = [8, 12, 16, 20]
+        pips = [6, 10, 14, 18]
+        fingers_down = all(lm[tips[i]][1] > lm[pips[i]][1] for i in range(4))
+
+        return thumb_above and fingers_down
+
+    def _is_two_fingers(self, lm) -> bool:
+        """Index and middle extended, others down."""
+        f = self._fingers_up(lm)
+        return f[0] == 0 and f[1] == 1 and f[2] == 1 and f[3] == 0 and f[4] == 0
+
+    def _is_L_shape(self, lm) -> bool:
+        """Thumb + index extended, middle/ring/pinky down."""
+        tips = [4, 8, 12, 16, 20]
+        pip  = [3, 6, 10, 14, 18]
+        idx_ext   = lm[tips[1]][1] < lm[pip[1]][1]
+        mid_down  = lm[tips[2]][1] > lm[pip[2]][1]
+        ring_down = lm[tips[3]][1] > lm[pip[3]][1]
+        pink_down = lm[tips[4]][1] > lm[pip[4]][1]
+        thu_ext   = abs(lm[tips[0]][0] - lm[0][0]) > 0.07
+        return idx_ext and mid_down and ring_down and pink_down and thu_ext
+
+    # ──────────────────────────────────────────────────────────
+    #  Drawing
+    # ──────────────────────────────────────────────────────────
+
+    def _draw_hand(self, frame, hand_lms, w, h, color):
+        connections = [
+            (0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),
+            (5,9),(9,10),(10,11),(11,12),(9,13),(13,14),(14,15),(15,16),
+            (13,17),(17,18),(18,19),(19,20),(0,17),
+        ]
+        pts = [(int(lm.x*w), int(lm.y*h)) for lm in hand_lms]
+        for a, b in connections:
+            cv2.line(frame, pts[a], pts[b], color, 2)
+        for pt in pts:
+            cv2.circle(frame, pt, 3, color, -1)
+        for tip in [4, 8, 12, 16, 20]:
+            cv2.circle(frame, pts[tip], 6, COL_YELLOW, -1)
+
+    def _status(self, msg):
+        self._status_msg  = msg
+        self._status_time = time.time()
+
+    def _draw_ui(self, frame, ctrl_lm, left_lm, right_lm, fps, w, h, now):
+        # FPS
+        cv2.putText(frame, f"FPS:{fps:.0f}", (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, COL_GREEN, 2)
+
+        # Pan hold charge bar
+        if ctrl_lm and not self._pan_hold_done and self._pan_point_start > 0:
+            held   = min(now - self._pan_point_start, 2.0)
+            charge = held / 2.0
+            bx, by = 8, 35
+            cv2.rectangle(frame, (bx, by), (bx+120, by+7), (40,40,40), -1)
+            cv2.rectangle(frame, (bx, by), (bx+int(charge*120), by+7), COL_CYAN, -1)
+            cv2.putText(frame, "PAN HOLD", (bx, by-3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (180,180,180), 1)
+
+        # Pan active indicator
+        if self._pan_locked:
+            cv2.putText(frame, "PAN ACTIVE", (w-100, 22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, COL_CYAN, 2)
+
+        # Lock charge bar
+        if self._lock_held and not self._lock_fired:
+            held   = min(now - self._lock_start, self.LOCK_HOLD)
+            charge = held / self.LOCK_HOLD
+            bx, by = 8, 52
+            cv2.rectangle(frame, (bx, by), (bx+120, by+7), (40,40,40), -1)
+            cv2.rectangle(frame, (bx, by), (bx+int(charge*120), by+7), COL_ORANGE, -1)
+            cv2.putText(frame, "LOCK HOLD", (bx, by-3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, (180,180,180), 1)
+
+        # Segmentation charge bar
+        if self._seg_held and not self._seg_fired:
+            held   = min(now - self._seg_start, self.SEG_HOLD)
+            charge = held / self.SEG_HOLD
+            bx, by = w//2 - 80, 8
+            cv2.rectangle(frame, (bx, by), (bx+160, by+10), (40,40,40), -1)
+            cv2.rectangle(frame, (bx, by), (bx+int(charge*160), by+10), (0, 200, 80), -1)
+            cv2.putText(frame, f"SEGMENTATION {held:.1f}s/3s", (bx, by+22),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (180,255,180), 1)
+
+        # Status message (fades after 2s)
+        if self._status_msg and now - self._status_time < 2.0:
+            alpha = max(0, 1.0 - (now - self._status_time) / 2.0)
+            color = tuple(int(c * alpha) for c in COL_WHITE)
+            cv2.putText(frame, self._status_msg, (8, h - 45),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+
+        # Bottom bar
+        cv2.rectangle(frame, (0, h-32), (w, h), (10,10,10), -1)
+        hints = [
+            "Rotate=Zoom  Point+hold=Pan  3fingers=Reset",
+            "BothThumbs3s=Segment  L-hold=Lock  2index=Window",
+        ]
+        hint = hints[int(now*0.5) % 2]   # alternates every 2s
+        cv2.putText(frame, hint, (6, h-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.33, (100,100,100), 1)
+
+        return frame
+
+
+
+
+# ──────────────────────────────────────────────
+#  Preprocessing Engine
+#  All filters run on CPU via numpy/scipy/opencv
+#  Applied per-slice at display time
+#  Original volume is NEVER modified
+# ──────────────────────────────────────────────
+class PreprocessingEngine:
+    FILTERS = [
+        "None (Original)",
+        "Gaussian Denoise",
+        "Median Filter",
+        "Sharpen",
+        "CLAHE (Contrast)",
+        "Unsharp Mask",
+        "Edge Enhance",
+        "Normalize",
+    ]
+
+    def __init__(self):
+        self.active_filter = "None (Original)"
+        self.strength      = 1.0   # 0.1 – 2.0
+
+    def apply(self, img_uint8: np.ndarray) -> np.ndarray:
+        """
+        Apply active filter to a uint8 grayscale slice.
+        Returns uint8 grayscale — never modifies input.
+        """
+        if self.active_filter == "None (Original)":
+            return img_uint8
+
+        img = img_uint8.astype(np.float32)
+        s   = max(0.1, self.strength)
+
+        if self.active_filter == "Gaussian Denoise":
+            result = gaussian_filter(img, sigma=s * 1.2)
+
+        elif self.active_filter == "Median Filter":
+            size   = max(3, int(s * 3) | 1)   # must be odd
+            result = median_filter(img, size=size)
+
+        elif self.active_filter == "Sharpen":
+            blur   = gaussian_filter(img, sigma=1.0)
+            result = np.clip(img + s * (img - blur) * 1.5, 0, 255)
+
+        elif self.active_filter == "CLAHE (Contrast)":
+            clahe  = cv2.createCLAHE(
+                clipLimit    = 2.0 + s * 2.0,
+                tileGridSize = (8, 8)
+            )
+            result = clahe.apply(img_uint8).astype(np.float32)
+
+        elif self.active_filter == "Unsharp Mask":
+            blur   = gaussian_filter(img, sigma=s * 2.0)
+            result = np.clip(img + s * 0.8 * (img - blur), 0, 255)
+
+        elif self.active_filter == "Edge Enhance":
+            sx     = cv2.Sobel(img_uint8, cv2.CV_32F, 1, 0, ksize=3)
+            sy     = cv2.Sobel(img_uint8, cv2.CV_32F, 0, 1, ksize=3)
+            edges  = np.sqrt(sx**2 + sy**2)
+            edges  = edges / (edges.max() + 1e-6) * 255
+            result = np.clip(img + s * 0.4 * edges, 0, 255)
+
+        elif self.active_filter == "Normalize":
+            lo     = np.percentile(img, 1)
+            hi     = np.percentile(img, 99)
+            result = np.clip((img - lo) / (hi - lo + 1e-6) * 255, 0, 255)
+
+        else:
+            result = img
+
+        return result.astype(np.uint8)
 
 
 # ──────────────────────────────────────────────
@@ -372,7 +1042,7 @@ class TwoHandGestureEngine(QThread):
         self.running              = True
         self.prev_pos_right       = []
         self.prev_pos_left        = []
-        self.smooth_window        = 5
+        self.smooth_window        = 4   # reduced for faster swipe response
         self.last_time            = {}
         self._left_fist_held      = False
         self._left_fist_start     = 0
@@ -449,19 +1119,27 @@ class TwoHandGestureEngine(QThread):
             if right_landmarks:
                 gesture = self._classify_full(right_landmarks, "right")
 
-                # ── POINT_UP + movement → pan ─────────
+                # ── POINT_UP + ACTIVE MOVEMENT → pan ──────
+                # Only consume the gesture if hand is actually moving
+                # If hand is still with POINT_UP, let SWIPE_UP fire normally
                 fingers_up = self._fingers_up(right_landmarks)
                 is_point   = (fingers_up == [0, 1, 0, 0, 0])
-                if is_point:
+                if is_point and self._pan_prev_pos is not None:
                     wrist_pos = right_landmarks[0]
-                    if self._pan_prev_pos is not None:
-                        dx = wrist_pos[0] - self._pan_prev_pos[0]
-                        dy = wrist_pos[1] - self._pan_prev_pos[1]
-                        if abs(dx) > 0.008 or abs(dy) > 0.008:
-                            self.pan_moved.emit(dx, dy)
+                    dx = wrist_pos[0] - self._pan_prev_pos[0]
+                    dy = wrist_pos[1] - self._pan_prev_pos[1]
+                    if abs(dx) > 0.012 or abs(dy) > 0.012:
+                        # Actively moving — pan mode
+                        self.pan_moved.emit(dx, dy)
+                        self._pan_active = True
+                        gesture = None   # consume: panning, not swiping
+                    else:
+                        # Stationary POINT_UP — let swipe/gesture fire
+                        self._pan_active = False
                     self._pan_prev_pos = wrist_pos
-                    self._pan_active   = True
-                    gesture = None
+                elif is_point:
+                    self._pan_prev_pos = right_landmarks[0]
+                    self._pan_active   = False
                 else:
                     self._pan_prev_pos = None
                     self._pan_active   = False
@@ -639,21 +1317,33 @@ class TwoHandGestureEngine(QThread):
         if len(pos_list) > self.smooth_window:
             pos_list.pop(0)
 
+        # ── Check swipe FIRST using velocity over position history ──
+        # This way POINT_UP during a swipe motion still fires SWIPE
+        swipe = None
+        if len(pos_list) >= self.smooth_window:
+            dy = pos_list[-1][1] - pos_list[0][1]
+            dx = pos_list[-1][0] - pos_list[0][0]
+            # Only fire swipe if vertical motion dominates
+            if abs(dy) > abs(dx) * 1.5:
+                if dy < -0.05:   swipe = "SWIPE_UP"
+                elif dy > 0.05:  swipe = "SWIPE_DOWN"
+
+        # ── Static pose classification ──────────────────────────────
         gesture = None
-        if num_up == 5:                    gesture = "OPEN_PALM"
+        if swipe:
+            gesture = swipe
+        elif num_up == 5:                  gesture = "OPEN_PALM"
         elif num_up == 0:                  gesture = "FIST"
-        elif fingers_up == [0,1,0,0,0]:   gesture = "POINT_UP"
         elif fingers_up == [0,1,1,0,0]:   gesture = "PEACE"
         elif self._is_pinch(lm):          gesture = "PINCH"
-        elif len(pos_list) >= self.smooth_window:
-            dy = pos_list[-1][1] - pos_list[0][1]
-            if dy < -0.06:   gesture = "SWIPE_UP"
-            elif dy > 0.06:  gesture = "SWIPE_DOWN"
+        elif fingers_up == [0,1,0,0,0]:   gesture = "POINT_UP"  # last: conflicts with swipe
 
+        # ── Per-gesture cooldown ────────────────────────────────────
         if gesture:
-            key  = f"{hand_key}_{gesture}"
-            now  = time.time()
-            if now - self.last_time.get(key, 0) < GESTURE_COOLDOWN:
+            key      = f"{hand_key}_{gesture}"
+            now      = time.time()
+            cooldown = GESTURE_COOLDOWN.get(gesture, 0.8)
+            if now - self.last_time.get(key, 0) < cooldown:
                 gesture = None
             else:
                 self.last_time[key] = now
@@ -753,6 +1443,7 @@ class MainWindow(QMainWindow):
         self.pan_x        = 0      # pan offset in pixels (image coords)
         self.pan_y        = 0
         self.view_locked  = False  # True = zoom/pan/slice locked
+        self.preprocessor = PreprocessingEngine()
         self._setup_ui()
         self._start_gesture_engine()
 
@@ -803,6 +1494,46 @@ class MainWindow(QMainWindow):
             pb.clicked.connect(lambda _,lv=l,wv=w: self._preset(lv,wv)); presets.addWidget(pb)
         wg.addLayout(presets)
         left.addWidget(win_group)
+
+        # ── AI Preprocessing Panel ────────────
+        pre_group = QGroupBox("AI Preprocessing")
+        pre_group.setStyleSheet(self._group_style())
+        pg = QVBoxLayout(pre_group)
+
+        filter_lbl = QLabel("Filter:")
+        filter_lbl.setStyleSheet("color:#bbb; font-size:10px;")
+        pg.addWidget(filter_lbl)
+
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(PreprocessingEngine.FILTERS)
+        self.filter_combo.setStyleSheet(
+            "QComboBox{background:#222;color:#ddd;border:1px solid #333;"
+            "border-radius:3px;padding:2px;font-size:10px;}"
+            "QComboBox::drop-down{border:none;}"
+            "QComboBox QAbstractItemView{background:#222;color:#ddd;"
+            "selection-background-color:#3af;}"
+        )
+        self.filter_combo.currentTextChanged.connect(self._on_filter_change)
+        pg.addWidget(self.filter_combo)
+
+        self.lbl_strength = QLabel("Strength: 1.0")
+        self.lbl_strength.setStyleSheet("color:#bbb; font-size:10px;")
+        pg.addWidget(self.lbl_strength)
+
+        self.slider_strength = QSlider(Qt.Horizontal)
+        self.slider_strength.setRange(1, 20)
+        self.slider_strength.setValue(10)
+        self.slider_strength.valueChanged.connect(self._on_strength_change)
+        pg.addWidget(self.slider_strength)
+
+        btn_reset_filter = QPushButton("Reset Filter")
+        btn_reset_filter.setFixedHeight(24)
+        btn_reset_filter.setStyleSheet(self._btn_style(small=True))
+        btn_reset_filter.clicked.connect(self._reset_filter)
+        pg.addWidget(btn_reset_filter)
+
+        left.addWidget(pre_group)
+
 
         ai_group = QGroupBox("AI Segmentation  (TotalSegmentator)")
         ai_group.setStyleSheet(self._group_style())
@@ -894,15 +1625,79 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Ready — open a DICOM file to begin.")
 
     def _start_gesture_engine(self):
-        self.gesture_engine = TwoHandGestureEngine()
-        self.gesture_engine.gesture_detected.connect(self._on_gesture)
+        self.gesture_engine = GestureEngine()
         self.gesture_engine.frame_ready.connect(self._on_cam_frame)
-        self.gesture_engine.ai_mode_changed.connect(self._on_ai_mode_changed)
-        self.gesture_engine.two_hand_gesture.connect(self._on_two_hand_gesture)
+        self.gesture_engine.slice_navigate.connect(self._on_slice_navigate)
+        self.gesture_engine.zoom_changed.connect(self._on_zoom_gesture)
         self.gesture_engine.pan_moved.connect(self._on_pan_gesture)
+        self.gesture_engine.window_changed.connect(self._on_window_gesture)
+        self.gesture_engine.lock_toggled.connect(self._toggle_lock)
+        self.gesture_engine.reset_triggered.connect(self._reset_view)
+        self.gesture_engine.segmentation_triggered.connect(self._run_segmentation)
+        self.gesture_engine.overlay_intensity.connect(self._on_overlay_intensity)
+        self.gesture_engine.recalibrate.connect(self._on_recalibrate)
         self.gesture_engine.start()
         self.lbl_cam_status.setText("● Camera: active")
         self.lbl_cam_status.setStyleSheet("color:#3f3; font-size:10px;")
+
+    # ── New GestureEngine signal handlers ──────────────────────
+    def _on_slice_navigate(self, direction):
+        """direction: -1 = prev, +1 = next"""
+        if self.view_locked:
+            return
+        if direction < 0:
+            self._prev_slice()
+        else:
+            self._next_slice()
+        self.lbl_gesture.setText(f"Swipe\n{'Prev' if direction < 0 else 'Next'} Slice")
+
+    def _on_zoom_gesture(self, delta):
+        """delta: positive = zoom in, negative = zoom out. Blocked when locked."""
+        if self.view_locked:
+            self.status.showMessage("View LOCKED — zoom disabled")
+            return
+        self.zoom = max(1.0, min(4.0, self.zoom + delta))
+        self._show_slice()
+        self.lbl_gesture.setText(f"Zoom {chr(43) if delta > 0 else chr(45)}{abs(delta):.2f}\n{self.zoom:.1f}x")
+
+    def _on_window_gesture(self, dwl, dww):
+        """
+        Adjust window level (WL) and/or window width (WW).
+        dwl: delta WL (brightness centre)
+        dww: delta WW (contrast range) — currently 0, reserved
+        """
+        if self.view_locked:
+            return
+        if dwl != 0:
+            self.wl = max(-1000, min(3000, self.wl + dwl))
+            self.slider_wl.blockSignals(True)
+            self.slider_wl.setValue(int(self.wl))
+            self.slider_wl.blockSignals(False)
+            self.lbl_wl.setText(f"WL: {int(self.wl)}")
+        if dww != 0:
+            self.ww = max(1.0, min(4000, self.ww + dww))
+            self.slider_ww.blockSignals(True)
+            self.slider_ww.setValue(int(self.ww))
+            self.slider_ww.blockSignals(False)
+            self.lbl_ww.setText(f"WW: {int(self.ww)}")
+        self._show_slice()
+        self.lbl_gesture.setText(f"Windowing\nWL:{self.wl:.0f} WW:{self.ww:.0f}")
+
+    def _on_overlay_intensity(self, direction):
+        """direction: +1 brighter, -1 dimmer"""
+        self.opacity = max(0.1, min(0.9, self.opacity + direction * 0.05))
+        self.slider_opacity.setValue(int(self.opacity * 100))
+        self._show_slice()
+        self.lbl_gesture.setText(f"Overlay\n{self.opacity*100:.0f}%")
+
+    def _on_recalibrate(self):
+        """Reset pan and zoom but keep slice."""
+        self.zoom  = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
+        self._show_slice()
+        self.lbl_gesture.setText("A-shape\nRecalibrated")
+        self.status.showMessage("Recalibrated — zoom and pan reset")
 
     def _on_gesture(self, gesture, hand):
         action = GESTURE_ACTIONS.get(gesture, gesture)
@@ -911,7 +1706,7 @@ class MainWindow(QMainWindow):
 
         # When view is locked, block all navigation except unlock
         if self.view_locked:
-            self.status.showMessage("🔒 View LOCKED — hold PEACE 1.5s to unlock")
+            self.status.showMessage("View LOCKED — Both L-shape to unlock")
             return
 
         if   gesture == "SWIPE_UP"  : self._prev_slice()
@@ -919,10 +1714,8 @@ class MainWindow(QMainWindow):
         elif gesture == "OPEN_PALM" : self._reset_view()
         elif gesture == "PINCH"     : self._zoom_in()
         elif gesture == "FIST"      : self._zoom_out()
-        # POINT_UP and PEACE are now handled by hold-timer in gesture engine
-        # (pan and lock respectively) — single-tap still scrolls as fallback
-        elif gesture == "POINT_UP"  : self._prev_slice()
-        elif gesture == "PEACE"     : self._next_slice()
+        # POINT_UP handled by pan engine — no fallback needed
+        # PEACE single tap — no action (reserved for two-hand lock)
 
     # ── Two-Hand Gesture Handler ───────────────────────────────
     def _on_two_hand_gesture(self, gesture):
@@ -980,11 +1773,20 @@ class MainWindow(QMainWindow):
         self._show_slice()
 
     def _on_pan_gesture(self, dx_norm, dy_norm):
-        """Called from gesture engine with normalised deltas (-1 to 1)."""
+        """
+        Called from gesture engine with normalised deltas.
+        Scale to image pixel space for actual pan movement.
+        """
         if self.volume is None or self.view_locked:
             return
         h, w = self.volume[self.current].shape
-        self._pan(int(dx_norm * w * 0.15), int(dy_norm * h * 0.15))
+        # Scale: normalised delta * image dimension * sensitivity
+        # Negative sign on dy because image y is inverted vs screen y
+        px = int(dx_norm * w * 3.0)
+        py = int(dy_norm * h * 3.0)
+        if abs(px) > 0 or abs(py) > 0:
+            self._pan(px, py)
+            self.lbl_gesture.setText(f"Pan\n{px:+d},{py:+d}px")
 
     def _on_ai_mode_changed(self, active):
         self.ai_mode = active
@@ -1065,6 +1867,25 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False); self.btn_segment.setEnabled(True)
         self.lbl_seg_status.setText(f"❌ {msg}"); self.status.showMessage("Segmentation error — see panel")
 
+
+    # ── Preprocessing Handlers ─────────────────────────────────
+    def _on_filter_change(self, filter_name):
+        self.preprocessor.active_filter = filter_name
+        self._show_slice()
+        self.status.showMessage("Filter: " + filter_name)
+        short = filter_name.split("(")[0].strip()
+        self.lbl_gesture.setText("Filter\n" + short)
+
+    def _on_strength_change(self, val):
+        self.preprocessor.strength = val / 10.0
+        self.lbl_strength.setText("Strength: " + str(round(self.preprocessor.strength, 1)))
+        self._show_slice()
+
+    def _reset_filter(self):
+        self.filter_combo.setCurrentIndex(0)
+        self.slider_strength.setValue(10)
+        self.status.showMessage("Filter reset to original")
+
     def _toggle_overlay(self):
         if self.seg_mask is not None:
             self.show_overlay = not self.show_overlay; self._show_slice()
@@ -1073,53 +1894,83 @@ class MainWindow(QMainWindow):
         self.opacity = val/100.0; self._show_slice()
 
     def _show_slice(self):
-        if self.volume is None: return
-        raw = self.volume[self.current]; img = self._apply_window(raw)
-        if self.zoom != 1.0 or (self.pan_x != 0 or self.pan_y != 0):
-            h, w   = img.shape
-            new_h  = int(h / self.zoom)
-            new_w  = int(w / self.zoom)
-            # Pan offsets shift the crop centre
+        if self.volume is None:
+            return
+
+        # 1. Window
+        raw = self.volume[self.current]
+        img = self._apply_window(raw)
+
+        # 2. Preprocessing filter
+        img = self.preprocessor.apply(img)
+
+        # 3. Zoom + pan crop (image)
+        if self.zoom != 1.0 or self.pan_x != 0 or self.pan_y != 0:
+            h, w  = img.shape
+            new_h = int(h / self.zoom)
+            new_w = int(w / self.zoom)
             cy = h//2 + self.pan_y
             cx = w//2 + self.pan_x
             y1 = max(0, cy - new_h//2); y2 = min(h, y1 + new_h)
             x1 = max(0, cx - new_w//2); x2 = min(w, x1 + new_w)
-            # Clamp so we never crop outside image
             if y2 > h: y1 = max(0, h - new_h); y2 = h
             if x2 > w: x1 = max(0, w - new_w); x2 = w
             img = cv2.resize(img[y1:y2, x1:x2], (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # 4. Overlay
         if self.show_overlay and self.seg_mask is not None:
-            mz=self.seg_mask.shape[0]; vz=self.volume.shape[0]
-            mask_idx=min(int(self.current*mz/vz), mz-1)
-            mask_slice=self.seg_mask[mask_idx]
-            # Resize mask to match original volume slice dimensions first
+            mz = self.seg_mask.shape[0]
+            vz = self.volume.shape[0]
+            mask_idx   = min(int(self.current * mz / vz), mz - 1)
+            mask_slice = self.seg_mask[mask_idx]
+
+            # Resize mask to raw slice dimensions
             raw_h, raw_w = self.volume[self.current].shape
             if mask_slice.shape != (raw_h, raw_w):
-                mask_slice=cv2.resize(mask_slice.astype(np.float32),
-                                      (raw_w, raw_h),
-                                      interpolation=cv2.INTER_NEAREST).astype(np.int32)
-            # Apply SAME zoom + pan to mask as to the image
-            if self.zoom != 1.0 or (self.pan_x != 0 or self.pan_y != 0):
+                mask_slice = cv2.resize(
+                    mask_slice.astype(np.float32),
+                    (raw_w, raw_h),
+                    interpolation=cv2.INTER_NEAREST
+                ).astype(np.int32)
+
+            # Apply same zoom + pan to mask
+            if self.zoom != 1.0 or self.pan_x != 0 or self.pan_y != 0:
                 h0, w0 = mask_slice.shape
-                new_h  = int(h0 / self.zoom); new_w = int(w0 / self.zoom)
-                cy = h0//2 + self.pan_y; cx = w0//2 + self.pan_x
+                new_h  = int(h0 / self.zoom)
+                new_w  = int(w0 / self.zoom)
+                cy = h0//2 + self.pan_y
+                cx = w0//2 + self.pan_x
                 y1 = max(0, cy - new_h//2); y2 = min(h0, y1 + new_h)
                 x1 = max(0, cx - new_w//2); x2 = min(w0, x1 + new_w)
                 if y2 > h0: y1 = max(0, h0 - new_h); y2 = h0
                 if x2 > w0: x1 = max(0, w0 - new_w); x2 = w0
-                mask_slice = cv2.resize(mask_slice[y1:y2, x1:x2].astype(np.float32),
-                                        (w0, h0),
-                                        interpolation=cv2.INTER_NEAREST).astype(np.int32)
-            # Now img and mask_slice are both at display resolution — overlay them
+                mask_slice = cv2.resize(
+                    mask_slice[y1:y2, x1:x2].astype(np.float32),
+                    (w0, h0),
+                    interpolation=cv2.INTER_NEAREST
+                ).astype(np.int32)
+
+            # Final size match
             if mask_slice.shape != img.shape:
-                mask_slice=cv2.resize(mask_slice.astype(np.float32),
-                                      (img.shape[1],img.shape[0]),
-                                      interpolation=cv2.INTER_NEAREST).astype(np.int32)
-            display=apply_segmentation_overlay(img,mask_slice,self.opacity)
-            h,w=display.shape[:2]; qimg=QImage(display.tobytes(),w,h,w*3,QImage.Format_BGR888)
+                mask_slice = cv2.resize(
+                    mask_slice.astype(np.float32),
+                    (img.shape[1], img.shape[0]),
+                    interpolation=cv2.INTER_NEAREST
+                ).astype(np.int32)
+
+            display = apply_segmentation_overlay(img, mask_slice, self.opacity)
+            h, w    = display.shape[:2]
+            qimg    = QImage(display.tobytes(), w, h, w * 3, QImage.Format_BGR888)
         else:
-            h,w=img.shape; qimg=QImage(img.tobytes(),w,h,w,QImage.Format_Grayscale8)
-        pix=QPixmap.fromImage(qimg).scaled(self.dicom_label.width()-4,self.dicom_label.height()-4,Qt.KeepAspectRatio,Qt.SmoothTransformation)
+            h, w = img.shape
+            qimg = QImage(img.tobytes(), w, h, w, QImage.Format_Grayscale8)
+
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.dicom_label.width() - 4,
+            self.dicom_label.height() - 4,
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
         self.dicom_label.setPixmap(pix)
         self.lbl_slice.setText(f"Slice:  {self.current+1} / {self.volume.shape[0]}")
 
@@ -1192,4 +2043,4 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     win = MainWindow()
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec_())   
